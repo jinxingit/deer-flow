@@ -36,7 +36,7 @@ class ChatRequest(BaseModel):
     )
     debug: Optional[bool] = Field(False, description="Whether to enable debug logging")
     thread_id: Optional[str] = Field(
-        "__default__", description="A specific conversation identifier"
+        None, description="A specific conversation identifier"
     )
     max_plan_iterations: Optional[int] = Field(
         1, description="The maximum number of plan iterations"

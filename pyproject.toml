@@ -86,4 +86,3 @@ extend-include = ["*.pyi"]
 indent-style = "space"
 line-ending = "auto"
 exclude = ['^/build/']
-

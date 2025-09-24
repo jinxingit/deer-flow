@@ -5,4 +5,5 @@ export * from "./chat";
 export * from "./mcp";
 export * from "./podcast";
 export * from "./prompt-enhancer";
+export * from "./sessions";
 export * from "./types";

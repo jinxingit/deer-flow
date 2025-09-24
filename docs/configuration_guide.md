@@ -9,6 +9,17 @@ cd deer-flow
 cp conf.yaml.example conf.yaml
 ```
 
+### Session Persistence
+
+DeerFlow 现已默认使用 SQLite 存储聊天会话与消息。若需要自定义数据库路径，可通过以下环境变量进行配置：
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `SESSION_DB_PATH` | 会话数据库文件路径。默认值为仓库根目录下的 `deerflow.db`。在生产环境中建议提供绝对路径或挂载到持久化卷。 |
+
+> [!TIP]
+> 在测试或临时体验场景中，可将 `SESSION_DB_PATH` 设置为位于可写目录中的文件路径（如 `/tmp/deerflow_sessions.db`），以避免权限问题。
+
 ## Which models does DeerFlow support?
 
 In DeerFlow, we currently only support non-reasoning models. This means models like OpenAI's o1/o3 or DeepSeek's R1 are not supported yet, but we plan to add support for them in the future. Additionally, all Gemma-3 models are currently unsupported due to the lack of tool usage capabilities.

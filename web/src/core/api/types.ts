@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 // SPDX-License-Identifier: MIT
 
-import type { Option } from "../messages";
+import type { MessageRole, Option, ToolCallRuntime } from "../messages";
 
 // Tool Calls
 
@@ -82,3 +82,32 @@ export type ChatEvent =
   | ToolCallChunksEvent
   | ToolCallResultEvent
   | InterruptEvent;
+
+// Session DTOs
+
+export interface SessionMessageDTO {
+  id: string;
+  role: MessageRole;
+  agent?: string | null;
+  content: string;
+  reasoning_content?: string | null;
+  tool_calls?: Array<ToolCallRuntime> | null;
+  metadata?: Record<string, unknown> | null;
+  seq: number;
+  created_at: string;
+}
+
+export interface SessionSummaryDTO {
+  id: string;
+  thread_id: string;
+  title?: string | null;
+  summary?: string | null;
+  last_message_preview?: string | null;
+  updated_at: string;
+  created_at: string;
+  archived: boolean;
+}
+
+export interface SessionDetailDTO extends SessionSummaryDTO {
+  messages: Array<SessionMessageDTO>;
+}

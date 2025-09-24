@@ -203,6 +203,9 @@ DeerFlow support private knowledgebase such as ragflow and vikingdb, so that you
   - Support for open source models like Qwen, you need to read the [configuration](docs/configuration_guide.md) for more details.
   - OpenAI-compatible API interface
   - Multi-tier LLM system for different task complexities
+- 💬 **Persistent Session Management**
+  - SQLite-backed multi-session chat with quick switch, rename, and delete actions
+  - Automatic 20-character titles summarising each conversation
 
 ### Tools and MCP Integrations
 

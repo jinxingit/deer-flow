@@ -1,13 +1,16 @@
 # Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
+import asyncio
 import base64
 import json
 import logging
-from typing import Annotated, Any, List, cast
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Annotated, Any, Dict, Iterable, List, Optional, cast
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from langchain_core.messages import AIMessageChunk, BaseMessage, ToolMessage
@@ -42,11 +45,19 @@ from src.server.chat_request import (
 from src.server.config_request import ConfigResponse
 from src.server.mcp_request import MCPServerMetadataRequest, MCPServerMetadataResponse
 from src.server.mcp_utils import load_mcp_tools
-from src.server.rag_request import (
+from src.server.rag_request import (  # type: ignore[import-untyped]
     RAGConfigResponse,
     RAGResourceRequest,
     RAGResourcesResponse,
 )
+from src.server.session.dependencies import (
+    get_session_store,
+    initialise_session_store,
+    set_session_store,
+)
+from src.server.session.router import router as session_router
+from src.server.session.store import SQLiteSessionStore
+from src.server.session.title import ensure_session_title
 from src.tools import VolcengineTTS
 from src.utils.json_utils import sanitize_args
 
@@ -54,10 +65,23 @@ logger = logging.getLogger(__name__)
 
 INTERNAL_SERVER_ERROR_DETAIL = "Internal Server Error"
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    session_store = initialise_session_store()
+    await session_store.init()
+    set_session_store(session_store)
+    try:
+        yield
+    finally:
+        await session_store.close()
+
+
 app = FastAPI(
     title="DeerFlow API",
     description="API for Deer",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 # Add CORS middleware
@@ -76,6 +100,8 @@ app.add_middleware(
     allow_headers=["*"],  # Now allow all headers, but can be restricted further
 )
 
+app.include_router(session_router)
+
 # Load examples into Milvus if configured
 load_examples()
 
@@ -83,8 +109,152 @@ in_memory_store = InMemoryStore()
 graph = build_graph_with_memory()
 
 
+@dataclass(slots=True)
+class _AssistantMessageBuilder:
+    agent: Optional[str]
+    content_chunks: List[str] = field(default_factory=list)
+    reasoning_chunks: List[str] = field(default_factory=list)
+    tool_calls: Optional[List[dict[str, Any]]] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class StreamPersistenceContext:
+    """Accumulates streaming events and persists final messages to the session store."""
+
+    def __init__(self, store: SQLiteSessionStore, session_id: str) -> None:
+        self._store = store
+        self._session_id = session_id
+        self._builders: Dict[str, _AssistantMessageBuilder] = {}
+        self._lock = asyncio.Lock()
+        self._assistant_written = False
+
+    async def handle_ai_event(self, event: Dict[str, Any]) -> None:
+        message_id = event.get("id")
+        if not message_id:
+            return
+
+        finalize: Optional[_AssistantMessageBuilder] = None
+        async with self._lock:
+            builder = self._builders.get(message_id)
+            if builder is None:
+                builder = _AssistantMessageBuilder(agent=event.get("agent"))
+                self._builders[message_id] = builder
+
+            if event.get("agent"):
+                builder.agent = event["agent"]
+
+            content = event.get("content")
+            if content:
+                builder.content_chunks.append(str(content))
+
+            reasoning = event.get("reasoning_content")
+            if reasoning:
+                builder.reasoning_chunks.append(str(reasoning))
+
+            tool_calls = event.get("tool_calls")
+            if tool_calls:
+                builder.tool_calls = _serialize_tool_calls(tool_calls)
+
+            metadata = {
+                key: event.get(key)
+                for key in ("langgraph_node", "langgraph_path", "langgraph_step", "checkpoint_ns")
+                if event.get(key)
+            }
+            if metadata:
+                builder.metadata.update(metadata)
+
+            finish_reason = event.get("finish_reason")
+            if finish_reason in {"stop", "interrupt"}:
+                builder.metadata.setdefault("finish_reason", finish_reason)
+                finalize = self._builders.pop(message_id, None)
+                if finalize is None:
+                    finalize = builder
+
+        if finalize is not None:
+            await self._persist_builder(finalize)
+
+    async def handle_tool_result(self, event: Dict[str, Any]) -> None:
+        content = event.get("content")
+        if content is None:
+            return
+        metadata = {
+            key: event.get(key)
+            for key in ("tool_call_id", "langgraph_node", "langgraph_path", "langgraph_step")
+            if event.get(key)
+        }
+        await self._store.append_message(
+            session_id=self._session_id,
+            role="tool",
+            agent=event.get("agent"),
+            content=str(content),
+            metadata=metadata or None,
+        )
+
+    async def handle_interrupt(self, event: Dict[str, Any]) -> None:
+        content = event.get("content")
+        if not content:
+            return
+        metadata = {
+            key: event.get(key)
+            for key in ("finish_reason", "options")
+            if event.get(key)
+        }
+        await self._store.append_message(
+            session_id=self._session_id,
+            role="assistant",
+            agent=event.get("agent"),
+            content=str(content),
+            metadata=metadata or None,
+        )
+        self._assistant_written = True
+
+    async def finalize(self) -> None:
+        async with self._lock:
+            pending = list(self._builders.values())
+            self._builders.clear()
+        for builder in pending:
+            await self._persist_builder(builder)
+        if self._assistant_written:
+            await ensure_session_title(self._store, self._session_id)
+
+    async def _persist_builder(self, builder: _AssistantMessageBuilder) -> None:
+        content = "".join(builder.content_chunks).strip()
+        reasoning = "".join(builder.reasoning_chunks).strip() or None
+        await self._store.append_message(
+            session_id=self._session_id,
+            role="assistant",
+            agent=builder.agent,
+            content=content,
+            reasoning_content=reasoning,
+            tool_calls=builder.tool_calls,
+            metadata=builder.metadata or None,
+        )
+        self._assistant_written = True
+
+
+def _serialize_tool_calls(tool_calls: Iterable[Any]) -> list[dict[str, Any]]:
+    serializable: list[dict[str, Any]] = []
+    for call in tool_calls:
+        if isinstance(call, dict):
+            data = dict(call)
+            if "args" in data:
+                data["args"] = sanitize_args(data["args"])
+            serializable.append(data)
+        else:
+            data = {
+                "id": getattr(call, "id", ""),
+                "name": getattr(call, "name", ""),
+                "args": sanitize_args(getattr(call, "args", {})),
+            }
+            serializable.append(data)
+    return serializable
+
+
 @app.post("/api/chat/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(
+    request: ChatRequest,
+    session_store: SQLiteSessionStore = Depends(get_session_store),
+):
     # Check if MCP server configuration is enabled
     mcp_enabled = get_bool_env("ENABLE_MCP_SERVER_CONFIGURATION", False)
 
@@ -96,12 +266,33 @@ async def chat_stream(request: ChatRequest):
         )
 
     thread_id = request.thread_id
-    if thread_id == "__default__":
-        thread_id = str(uuid4())
+    if not thread_id:
+        raise HTTPException(status_code=400, detail="thread_id is required")
+
+    session = await session_store.get_session_by_thread(thread_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.archived:
+        raise HTTPException(status_code=403, detail="Session has been archived")
+
+    incoming_messages = request.messages or []
+    if incoming_messages:
+        last_message = incoming_messages[-1]
+        if last_message.role == "user":
+            content = _stringify_message_content(last_message.content)
+            if content:
+                await session_store.append_message(
+                    session_id=session.id,
+                    role="user",
+                    content=content,
+                )
+
+    persistence = StreamPersistenceContext(session_store, session.id)
+    request_payload = request.model_dump()
 
     return StreamingResponse(
         _astream_workflow_generator(
-            request.model_dump()["messages"],
+            request_payload["messages"],
             thread_id,
             request.resources,
             request.max_plan_iterations,
@@ -113,6 +304,7 @@ async def chat_stream(request: ChatRequest):
             request.enable_background_investigation,
             request.report_style,
             request.enable_deep_thinking,
+            persistence,
         ),
         media_type="text/event-stream",
     )
@@ -174,22 +366,24 @@ def _create_event_stream_message(
     return event_stream_message
 
 
-def _create_interrupt_event(thread_id, event_data):
+async def _create_interrupt_event(
+    thread_id, event_data, persistence: Optional[StreamPersistenceContext] = None
+):
     """Create interrupt event."""
-    return _make_event(
-        "interrupt",
-        {
-            "thread_id": thread_id,
-            "id": event_data["__interrupt__"][0].ns[0],
-            "role": "assistant",
-            "content": event_data["__interrupt__"][0].value,
-            "finish_reason": "interrupt",
-            "options": [
-                {"text": "Edit plan", "value": "edit_plan"},
-                {"text": "Start research", "value": "accepted"},
-            ],
-        },
-    )
+    payload = {
+        "thread_id": thread_id,
+        "id": event_data["__interrupt__"][0].ns[0],
+        "role": "assistant",
+        "content": event_data["__interrupt__"][0].value,
+        "finish_reason": "interrupt",
+        "options": [
+            {"text": "Edit plan", "value": "edit_plan"},
+            {"text": "Start research", "value": "accepted"},
+        ],
+    }
+    if persistence:
+        await persistence.handle_interrupt(payload)
+    return _make_event("interrupt", payload)
 
 
 def _process_initial_messages(message, thread_id):
@@ -209,7 +403,35 @@ def _process_initial_messages(message, thread_id):
     )
 
 
-async def _process_message_chunk(message_chunk, message_metadata, thread_id, agent):
+def _stringify_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            item_type = getattr(item, "type", None) or item.get("type") if isinstance(item, dict) else None
+            if item_type == "text":
+                text = getattr(item, "text", None) if not isinstance(item, dict) else item.get("text")
+                if text:
+                    parts.append(str(text))
+            elif item_type == "image":
+                url = getattr(item, "image_url", None) if not isinstance(item, dict) else item.get("image_url")
+                if url:
+                    parts.append(f"[image:{url}]")
+        return "\n".join(parts)
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except TypeError:
+        return str(content)
+
+
+async def _process_message_chunk(
+    message_chunk,
+    message_metadata,
+    thread_id,
+    agent,
+    persistence: Optional[StreamPersistenceContext] = None,
+):
     """Process a single message chunk and yield appropriate events."""
     agent_name = _get_agent_name(agent, message_metadata)
     event_stream_message = _create_event_stream_message(
@@ -219,6 +441,9 @@ async def _process_message_chunk(message_chunk, message_metadata, thread_id, age
     if isinstance(message_chunk, ToolMessage):
         # Tool Message - Return the result of the tool call
         event_stream_message["tool_call_id"] = message_chunk.tool_call_id
+        event_stream_message["role"] = "tool"
+        if persistence:
+            await persistence.handle_tool_result(event_stream_message)
         yield _make_event("tool_call_result", event_stream_message)
     elif isinstance(message_chunk, AIMessageChunk):
         # AI Message - Raw message tokens
@@ -228,20 +453,30 @@ async def _process_message_chunk(message_chunk, message_metadata, thread_id, age
             event_stream_message["tool_call_chunks"] = _process_tool_call_chunks(
                 message_chunk.tool_call_chunks
             )
+            if persistence:
+                await persistence.handle_ai_event(event_stream_message)
             yield _make_event("tool_calls", event_stream_message)
         elif message_chunk.tool_call_chunks:
             # AI Message - Tool Call Chunks
             event_stream_message["tool_call_chunks"] = _process_tool_call_chunks(
                 message_chunk.tool_call_chunks
             )
+            if persistence:
+                await persistence.handle_ai_event(event_stream_message)
             yield _make_event("tool_call_chunks", event_stream_message)
         else:
             # AI Message - Raw message tokens
+            if persistence:
+                await persistence.handle_ai_event(event_stream_message)
             yield _make_event("message_chunk", event_stream_message)
 
 
 async def _stream_graph_events(
-    graph_instance, workflow_input, workflow_config, thread_id
+    graph_instance,
+    workflow_input,
+    workflow_config,
+    thread_id,
+    persistence: Optional[StreamPersistenceContext] = None,
 ):
     """Stream events from the graph and process them."""
     try:
@@ -253,7 +488,9 @@ async def _stream_graph_events(
         ):
             if isinstance(event_data, dict):
                 if "__interrupt__" in event_data:
-                    yield _create_interrupt_event(thread_id, event_data)
+                    yield await _create_interrupt_event(
+                        thread_id, event_data, persistence
+                    )
                 continue
 
             message_chunk, message_metadata = cast(
@@ -261,7 +498,11 @@ async def _stream_graph_events(
             )
 
             async for event in _process_message_chunk(
-                message_chunk, message_metadata, thread_id, agent
+                message_chunk,
+                message_metadata,
+                thread_id,
+                agent,
+                persistence,
             ):
                 yield event
     except Exception as e:
@@ -289,6 +530,7 @@ async def _astream_workflow_generator(
     enable_background_investigation: bool,
     report_style: ReportStyle,
     enable_deep_thinking: bool,
+    persistence: StreamPersistenceContext,
 ):
     # Process initial messages
     for message in messages:
@@ -334,38 +576,49 @@ async def _astream_workflow_generator(
         "row_factory": "dict_row",
         "prepare_threshold": 0,
     }
-    if checkpoint_saver and checkpoint_url != "":
-        if checkpoint_url.startswith("postgresql://"):
-            logger.info("start async postgres checkpointer.")
-            async with AsyncConnectionPool(
-                checkpoint_url, kwargs=connection_kwargs
-            ) as conn:
-                checkpointer = AsyncPostgresSaver(conn)
-                await checkpointer.setup()
-                graph.checkpointer = checkpointer
-                graph.store = in_memory_store
-                async for event in _stream_graph_events(
-                    graph, workflow_input, workflow_config, thread_id
-                ):
-                    yield event
+    try:
+        if checkpoint_saver and checkpoint_url != "":
+            if checkpoint_url.startswith("postgresql://"):
+                logger.info("start async postgres checkpointer.")
+                async with AsyncConnectionPool(
+                    checkpoint_url, kwargs=connection_kwargs
+                ) as conn:
+                    checkpointer = AsyncPostgresSaver(conn)
+                    await checkpointer.setup()
+                    graph.checkpointer = checkpointer
+                    graph.store = in_memory_store
+                    async for event in _stream_graph_events(
+                        graph,
+                        workflow_input,
+                        workflow_config,
+                        thread_id,
+                        persistence,
+                    ):
+                        yield event
 
-        if checkpoint_url.startswith("mongodb://"):
-            logger.info("start async mongodb checkpointer.")
-            async with AsyncMongoDBSaver.from_conn_string(
-                checkpoint_url
-            ) as checkpointer:
-                graph.checkpointer = checkpointer
-                graph.store = in_memory_store
-                async for event in _stream_graph_events(
-                    graph, workflow_input, workflow_config, thread_id
-                ):
-                    yield event
-    else:
-        # Use graph without MongoDB checkpointer
-        async for event in _stream_graph_events(
-            graph, workflow_input, workflow_config, thread_id
-        ):
-            yield event
+            if checkpoint_url.startswith("mongodb://"):
+                logger.info("start async mongodb checkpointer.")
+                async with AsyncMongoDBSaver.from_conn_string(
+                    checkpoint_url
+                ) as checkpointer:
+                    graph.checkpointer = checkpointer
+                    graph.store = in_memory_store
+                    async for event in _stream_graph_events(
+                        graph,
+                        workflow_input,
+                        workflow_config,
+                        thread_id,
+                        persistence,
+                    ):
+                        yield event
+        else:
+            # Use graph without MongoDB checkpointer
+            async for event in _stream_graph_events(
+                graph, workflow_input, workflow_config, thread_id, persistence
+            ):
+                yield event
+    finally:
+        await persistence.finalize()
 
 
 def _make_event(event_type: str, data: dict[str, any]):

@@ -6,18 +6,33 @@ import { toast } from "sonner";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 
-import { chatStream, generatePodcast } from "../api";
-import type { Message, Resource } from "../messages";
+import {
+  chatStream,
+  createSession as apiCreateSession,
+  deleteSession as apiDeleteSession,
+  fetchSession as apiFetchSession,
+  fetchSessions as apiFetchSessions,
+  generatePodcast,
+  updateSession as apiUpdateSession,
+  type SessionDetail,
+  type SessionMessage as SessionMessagePayload,
+  type SessionSummary as SessionSummaryPayload,
+} from "../api";
+import type { Message, Resource, ToolCallRuntime } from "../messages";
 import { mergeMessage } from "../messages";
 import { parseJSON } from "../utils";
 
 import { getChatStreamSettings } from "./settings-store";
 
-const THREAD_ID = nanoid();
+const ACTIVE_SESSION_STORAGE_KEY = "deerflow/activeSessionId";
+let pendingSessionCreation: Promise<void> | null = null;
 
-export const useStore = create<{
+interface StoreState {
   responding: boolean;
-  threadId: string | undefined;
+  sessions: SessionSummaryPayload[];
+  sessionLoading: boolean;
+  activeSessionId: string | null;
+  activeThreadId: string | null;
   messageIds: string[];
   messages: Map<string, Message>;
   researchIds: string[];
@@ -27,15 +42,24 @@ export const useStore = create<{
   ongoingResearchId: string | null;
   openResearchId: string | null;
 
+  setResponding: (value: boolean) => void;
+  setSessions: (sessions: SessionSummaryPayload[]) => void;
+  setSessionLoading: (value: boolean) => void;
+  setActiveSessionState: (sessionId: string | null, threadId: string | null) => void;
+  hydrateMessages: (messages: Message[]) => void;
   appendMessage: (message: Message) => void;
   updateMessage: (message: Message) => void;
-  updateMessages: (messages: Message[]) => void;
   openResearch: (researchId: string | null) => void;
   closeResearch: () => void;
   setOngoingResearch: (researchId: string | null) => void;
-}>((set) => ({
+}
+
+export const useStore = create<StoreState>((set) => ({
   responding: false,
-  threadId: THREAD_ID,
+  sessions: [],
+  sessionLoading: false,
+  activeSessionId: null,
+  activeThreadId: null,
   messageIds: [],
   messages: new Map<string, Message>(),
   researchIds: [],
@@ -45,34 +69,220 @@ export const useStore = create<{
   ongoingResearchId: null,
   openResearchId: null,
 
-  appendMessage(message: Message) {
-    set((state) => ({
-      messageIds: [...state.messageIds, message.id],
-      messages: new Map(state.messages).set(message.id, message),
-    }));
+  setResponding(value) {
+    set({ responding: value });
   },
-  updateMessage(message: Message) {
-    set((state) => ({
-      messages: new Map(state.messages).set(message.id, message),
-    }));
+  setSessions(sessions) {
+    set({ sessions });
   },
-  updateMessages(messages: Message[]) {
-    set((state) => {
-      const newMessages = new Map(state.messages);
-      messages.forEach((m) => newMessages.set(m.id, m));
-      return { messages: newMessages };
+  setSessionLoading(value) {
+    set({ sessionLoading: value });
+  },
+  setActiveSessionState(sessionId, threadId) {
+    if (typeof window !== "undefined") {
+      if (sessionId) {
+        localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, sessionId);
+      } else {
+        localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+      }
+    }
+    set({ activeSessionId: sessionId, activeThreadId: threadId });
+  },
+  hydrateMessages(messages) {
+    const computed = buildStateFromMessages(messages);
+    set({
+      messageIds: computed.messageIds,
+      messages: computed.messageMap,
+      researchIds: computed.researchIds,
+      researchPlanIds: computed.researchPlanIds,
+      researchReportIds: computed.researchReportIds,
+      researchActivityIds: computed.researchActivityIds,
+      ongoingResearchId: null,
+      openResearchId: null,
     });
   },
-  openResearch(researchId: string | null) {
+  appendMessage(message) {
+    set((state) => {
+      const nextMessages = new Map(state.messages);
+      nextMessages.set(message.id, message);
+      const nextMessageIds = [...state.messageIds, message.id];
+
+      const updates: Partial<StoreState> = {
+        messageIds: nextMessageIds,
+        messages: nextMessages,
+      };
+
+      if (
+        message.agent === "coder" ||
+        message.agent === "reporter" ||
+        message.agent === "researcher"
+      ) {
+        const {
+          researchIds,
+          researchPlanIds,
+          researchReportIds,
+          researchActivityIds,
+          ongoingResearchId,
+        } = updateResearchStateFromMessage(state, message);
+        updates.researchIds = researchIds;
+        updates.researchPlanIds = researchPlanIds;
+        updates.researchReportIds = researchReportIds;
+        updates.researchActivityIds = researchActivityIds;
+        updates.ongoingResearchId = ongoingResearchId;
+        if (message.agent === "coder" || message.agent === "researcher") {
+          updates.openResearchId = ongoingResearchId;
+        }
+        if (message.agent === "reporter") {
+          updates.openResearchId = null;
+        }
+      }
+      if (updates.ongoingResearchId === undefined) {
+        updates.ongoingResearchId = state.ongoingResearchId;
+      }
+      if (updates.openResearchId === undefined) {
+        updates.openResearchId = state.openResearchId;
+      }
+      return updates;
+    });
+  },
+  updateMessage(message) {
+    set((state) => {
+      const nextMessages = new Map(state.messages).set(message.id, message);
+      let ongoingResearchId = state.ongoingResearchId;
+      if (
+        ongoingResearchId &&
+        message.agent === "reporter" &&
+        !message.isStreaming
+      ) {
+        ongoingResearchId = null;
+      }
+      return {
+        messages: nextMessages,
+        ongoingResearchId,
+      } as Partial<StoreState>;
+    });
+  },
+  openResearch(researchId) {
     set({ openResearchId: researchId });
   },
   closeResearch() {
     set({ openResearchId: null });
   },
-  setOngoingResearch(researchId: string | null) {
+  setOngoingResearch(researchId) {
     set({ ongoingResearchId: researchId });
   },
 }));
+
+export async function loadSessions() {
+  useStore.getState().setSessionLoading(true);
+  try {
+    const sessions = await apiFetchSessions();
+    useStore.getState().setSessions(sessions);
+    const storedId =
+      typeof window !== "undefined"
+        ? localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY)
+        : null;
+    const preferred = sessions.find((session) => session.id === storedId);
+    const fallback = sessions[0];
+    if (preferred) {
+      await activateSession(preferred.id);
+    } else if (fallback) {
+      await activateSession(fallback.id);
+    } else {
+      await createAndActivateSession();
+    }
+  } catch (error) {
+    console.error(error);
+    toast("加载会话列表失败，请稍后重试。");
+  } finally {
+    useStore.getState().setSessionLoading(false);
+  }
+}
+
+export async function activateSession(sessionId: string) {
+  useStore.getState().setSessionLoading(true);
+  try {
+    const detail = await apiFetchSession(sessionId);
+    const messages = detail.messages.map((message) =>
+      toMessage(detail.threadId, message),
+    );
+    useStore.getState().hydrateMessages(messages);
+    useStore.getState().setActiveSessionState(detail.id, detail.threadId);
+    useStore.getState().setSessions(updateSummaryList(detail));
+  } catch (error) {
+    console.error(error);
+    toast("加载会话失败，请稍后重试。");
+  } finally {
+    useStore.getState().setSessionLoading(false);
+  }
+}
+
+export async function createAndActivateSession(initialMessage?: string) {
+  if (pendingSessionCreation) {
+    await pendingSessionCreation;
+    return;
+  }
+  pendingSessionCreation = (async () => {
+    useStore.getState().setSessionLoading(true);
+    try {
+      const detail = await apiCreateSession(initialMessage);
+      useStore.getState().setSessions([
+        transformDetailToSummary(detail),
+        ...useStore.getState().sessions,
+      ]);
+      const messages = detail.messages.map((message) =>
+        toMessage(detail.threadId, message),
+      );
+      useStore.getState().hydrateMessages(messages);
+      useStore.getState().setActiveSessionState(detail.id, detail.threadId);
+    } catch (error) {
+      console.error(error);
+      toast("创建会话失败，请稍后重试。");
+    } finally {
+      useStore.getState().setSessionLoading(false);
+      pendingSessionCreation = null;
+    }
+  })();
+  await pendingSessionCreation;
+}
+
+export async function renameSession(sessionId: string, title: string) {
+  try {
+    const detail = await apiUpdateSession(sessionId, { title });
+    useStore.getState().setSessions(updateSummaryList(detail));
+    if (useStore.getState().activeSessionId === sessionId) {
+      const messages = detail.messages.map((message) =>
+        toMessage(detail.threadId, message),
+      );
+      useStore.getState().hydrateMessages(messages);
+      useStore.getState().setActiveSessionState(detail.id, detail.threadId);
+    }
+  } catch (error) {
+    console.error(error);
+    toast("重命名会话失败，请稍后重试。");
+  }
+}
+
+export async function removeSession(sessionId: string) {
+  try {
+    await apiDeleteSession(sessionId);
+    const remaining = useStore
+      .getState()
+      .sessions.filter((session) => session.id !== sessionId);
+    useStore.getState().setSessions(remaining);
+    if (useStore.getState().activeSessionId === sessionId) {
+      if (remaining.length > 0) {
+        await activateSession(remaining[0]!.id);
+      } else {
+        useStore.getState().hydrateMessages([]);
+        useStore.getState().setActiveSessionState(null, null);
+      }
+    }
+  } catch (error) {
+    console.error(error);
+    toast("删除会话失败，请稍后重试。");
+  }
+}
 
 export async function sendMessage(
   content?: string,
@@ -85,12 +295,14 @@ export async function sendMessage(
   } = {},
   options: { abortSignal?: AbortSignal } = {},
 ) {
+  const { sessionId, threadId } = await ensureActiveSession();
+
   if (content != null) {
     appendMessage({
       id: nanoid(),
-      threadId: THREAD_ID,
+      threadId,
       role: "user",
-      content: content,
+      content,
       contentChunks: [content],
       resources,
     });
@@ -100,7 +312,7 @@ export async function sendMessage(
   const stream = chatStream(
     content ?? "[REPLAY]",
     {
-      thread_id: THREAD_ID,
+      thread_id: threadId,
       interrupt_feedback: interruptFeedback,
       resources,
       auto_accepted_plan: settings.autoAcceptedPlan,
@@ -146,10 +358,10 @@ export async function sendMessage(
         updateMessage(message);
       }
     }
-  } catch {
-    toast("An error occurred while generating the response. Please try again.");
-    // Update message status.
-    // TODO: const isAborted = (error as Error).name === "AbortError";
+    await refreshSessionSummary(sessionId);
+  } catch (error) {
+    console.error(error);
+    toast("生成回复时出现错误，请稍后再试。");
     if (messageId != null) {
       const message = getMessage(messageId);
       if (message?.isStreaming) {
@@ -163,8 +375,17 @@ export async function sendMessage(
   }
 }
 
+export async function refreshSessionSummary(sessionId: string) {
+  try {
+    const detail = await apiFetchSession(sessionId);
+    useStore.getState().setSessions(updateSummaryList(detail));
+  } catch (error) {
+    console.error(error);
+  }
+}
+
 function setResponding(value: boolean) {
-  useStore.setState({ responding: value });
+  useStore.getState().setResponding(value);
 }
 
 function existsMessage(id: string) {
@@ -178,38 +399,16 @@ function getMessage(id: string) {
 function findMessageByToolCallId(toolCallId: string) {
   return Array.from(useStore.getState().messages.values())
     .reverse()
-    .find((message) => {
-      if (message.toolCalls) {
-        return message.toolCalls.some((toolCall) => toolCall.id === toolCallId);
-      }
-      return false;
-    });
+    .find((message) =>
+      message.toolCalls?.some((toolCall: ToolCallRuntime) => toolCall.id === toolCallId),
+    );
 }
 
 function appendMessage(message: Message) {
-  if (
-    message.agent === "coder" ||
-    message.agent === "reporter" ||
-    message.agent === "researcher"
-  ) {
-    if (!getOngoingResearchId()) {
-      const id = message.id;
-      appendResearch(id);
-      openResearch(id);
-    }
-    appendResearchActivity(message);
-  }
   useStore.getState().appendMessage(message);
 }
 
 function updateMessage(message: Message) {
-  if (
-    getOngoingResearchId() &&
-    message.agent === "reporter" &&
-    !message.isStreaming
-  ) {
-    useStore.getState().setOngoingResearch(null);
-  }
   useStore.getState().updateMessage(message);
 }
 
@@ -217,54 +416,142 @@ function getOngoingResearchId() {
   return useStore.getState().ongoingResearchId;
 }
 
-function appendResearch(researchId: string) {
-  let planMessage: Message | undefined;
-  const reversedMessageIds = [...useStore.getState().messageIds].reverse();
-  for (const messageId of reversedMessageIds) {
-    const message = getMessage(messageId);
-    if (message?.agent === "planner") {
-      planMessage = message;
+function updateResearchStateFromMessage(state: StoreState, message: Message) {
+  const researchIds = [...state.researchIds];
+  const researchPlanIds = new Map(state.researchPlanIds);
+  const researchReportIds = new Map(state.researchReportIds);
+  const researchActivityIds = new Map(state.researchActivityIds);
+  let ongoingResearchId = state.ongoingResearchId;
+  let lastPlannerId: string | null = null;
+
+  for (let i = state.messageIds.length - 1; i >= 0; i -= 1) {
+    const id = state.messageIds[i]!;
+    const msg = state.messages.get(id);
+    if (msg?.agent === "planner") {
+      lastPlannerId = msg.id;
       break;
     }
   }
-  const messageIds = [researchId];
-  messageIds.unshift(planMessage!.id);
-  useStore.setState({
-    ongoingResearchId: researchId,
-    researchIds: [...useStore.getState().researchIds, researchId],
-    researchPlanIds: new Map(useStore.getState().researchPlanIds).set(
-      researchId,
-      planMessage!.id,
-    ),
-    researchActivityIds: new Map(useStore.getState().researchActivityIds).set(
-      researchId,
-      messageIds,
-    ),
-  });
-}
 
-function appendResearchActivity(message: Message) {
-  const researchId = getOngoingResearchId();
-  if (researchId) {
-    const researchActivityIds = useStore.getState().researchActivityIds;
-    const current = researchActivityIds.get(researchId)!;
-    if (!current.includes(message.id)) {
-      useStore.setState({
-        researchActivityIds: new Map(researchActivityIds).set(researchId, [
-          ...current,
-          message.id,
-        ]),
-      });
-    }
-    if (message.agent === "reporter") {
-      useStore.setState({
-        researchReportIds: new Map(useStore.getState().researchReportIds).set(
-          researchId,
-          message.id,
-        ),
-      });
+  if (!ongoingResearchId && lastPlannerId) {
+    ongoingResearchId = message.id;
+    researchIds.push(message.id);
+    researchPlanIds.set(message.id, lastPlannerId);
+    researchActivityIds.set(message.id, [lastPlannerId, message.id]);
+  } else if (ongoingResearchId) {
+    const activity = researchActivityIds.get(ongoingResearchId) ?? [];
+    if (!activity.includes(message.id)) {
+      researchActivityIds.set(ongoingResearchId, [...activity, message.id]);
     }
   }
+
+  if (ongoingResearchId && message.agent === "reporter") {
+    researchReportIds.set(ongoingResearchId, message.id);
+  }
+
+  return {
+    researchIds,
+    researchPlanIds,
+    researchReportIds,
+    researchActivityIds,
+    ongoingResearchId,
+  };
+}
+
+function buildStateFromMessages(messages: Message[]) {
+  const messageIds: string[] = [];
+  const messageMap = new Map<string, Message>();
+  const researchIds: string[] = [];
+  const researchPlanIds = new Map<string, string>();
+  const researchReportIds = new Map<string, string>();
+  const researchActivityIds = new Map<string, string[]>();
+  let lastPlannerId: string | null = null;
+  let currentResearchId: string | null = null;
+
+  for (const message of messages) {
+    messageIds.push(message.id);
+    messageMap.set(message.id, message);
+
+    if (message.agent === "planner") {
+      lastPlannerId = message.id;
+      continue;
+    }
+
+    if (
+      message.agent === "coder" ||
+      message.agent === "reporter" ||
+      message.agent === "researcher"
+    ) {
+      if (!currentResearchId && lastPlannerId) {
+        currentResearchId = message.id;
+        researchIds.push(message.id);
+        researchPlanIds.set(message.id, lastPlannerId);
+        researchActivityIds.set(message.id, [lastPlannerId, message.id]);
+      } else if (currentResearchId) {
+        const activity = researchActivityIds.get(currentResearchId) ?? [];
+        if (!activity.includes(message.id)) {
+          researchActivityIds.set(currentResearchId, [...activity, message.id]);
+        }
+      }
+      if (currentResearchId && message.agent === "reporter") {
+        researchReportIds.set(currentResearchId, message.id);
+        currentResearchId = null;
+      }
+    }
+  }
+
+  return {
+    messageIds,
+    messageMap,
+    researchIds,
+    researchPlanIds,
+    researchReportIds,
+    researchActivityIds,
+  };
+}
+
+function transformDetailToSummary(detail: SessionDetail): SessionSummaryPayload {
+  const { messages, ...summary } = detail;
+  return summary;
+}
+
+function updateSummaryList(detail: SessionDetail) {
+  const summaries = useStore.getState().sessions;
+  const summary = transformDetailToSummary(detail);
+  const filtered = summaries.filter((item) => item.id !== summary.id);
+  return [summary, ...filtered];
+}
+
+function toMessage(threadId: string, message: SessionMessagePayload): Message {
+  const reasoningContent = message.reasoningContent ?? undefined;
+  return {
+    id: message.id,
+    threadId,
+    agent: message.agent as Message["agent"],
+    role: message.role,
+    content: message.content,
+    contentChunks: [message.content],
+    reasoningContent,
+    reasoningContentChunks: reasoningContent ? [reasoningContent] : [],
+    toolCalls: message.toolCalls ?? undefined,
+    finishReason: "stop",
+  };
+}
+
+async function ensureActiveSession() {
+  const state = useStore.getState();
+  if (state.activeSessionId && state.activeThreadId) {
+    return { sessionId: state.activeSessionId, threadId: state.activeThreadId };
+  }
+  await createAndActivateSession();
+  const refreshed = useStore.getState();
+  if (!refreshed.activeSessionId || !refreshed.activeThreadId) {
+    throw new Error("Failed to obtain active session");
+  }
+  return {
+    sessionId: refreshed.activeSessionId,
+    threadId: refreshed.activeThreadId,
+  };
 }
 
 export function openResearch(researchId: string | null) {
@@ -278,6 +565,11 @@ export function closeResearch() {
 export async function listenToPodcast(researchId: string) {
   const planMessageId = useStore.getState().researchPlanIds.get(researchId);
   const reportMessageId = useStore.getState().researchReportIds.get(researchId);
+  const threadId = useStore.getState().activeThreadId;
+  if (!threadId) {
+    toast("请先选择一个会话。");
+    return;
+  }
   if (planMessageId && reportMessageId) {
     const planMessage = getMessage(planMessageId)!;
     const title = parseJSON(planMessage.content, { title: "Untitled" }).title;
@@ -285,7 +577,7 @@ export async function listenToPodcast(researchId: string) {
     if (reportMessage?.content) {
       appendMessage({
         id: nanoid(),
-        threadId: THREAD_ID,
+        threadId,
         role: "user",
         content: "Please generate a podcast for the above research.",
         contentChunks: [],
@@ -294,7 +586,7 @@ export async function listenToPodcast(researchId: string) {
       const podcastObject = { title, researchId };
       const podcastMessage: Message = {
         id: podCastMessageId,
-        threadId: THREAD_ID,
+        threadId,
         role: "assistant",
         agent: "podcast",
         content: JSON.stringify(podcastObject),
@@ -304,30 +596,26 @@ export async function listenToPodcast(researchId: string) {
         isStreaming: true,
       };
       appendMessage(podcastMessage);
-      // Generating podcast...
       let audioUrl: string | undefined;
       try {
         audioUrl = await generatePodcast(reportMessage.content);
-      } catch (e) {
-        console.error(e);
+      } catch (error) {
+        console.error(error);
         useStore.setState((state) => ({
-          messages: new Map(useStore.getState().messages).set(
-            podCastMessageId,
-            {
-              ...state.messages.get(podCastMessageId)!,
-              content: JSON.stringify({
-                ...podcastObject,
-                error: e instanceof Error ? e.message : "Unknown error",
-              }),
-              isStreaming: false,
-            },
-          ),
+          messages: new Map(state.messages).set(podCastMessageId, {
+            ...state.messages.get(podCastMessageId)!,
+            content: JSON.stringify({
+              ...podcastObject,
+              error: error instanceof Error ? error.message : "Unknown error",
+            }),
+            isStreaming: false,
+          }),
         }));
-        toast("An error occurred while generating podcast. Please try again.");
+        toast("生成播客时出现错误，请稍后再试。");
         return;
       }
       useStore.setState((state) => ({
-        messages: new Map(useStore.getState().messages).set(podCastMessageId, {
+        messages: new Map(state.messages).set(podCastMessageId, {
           ...state.messages.get(podCastMessageId)!,
           content: JSON.stringify({ ...podcastObject, audioUrl }),
           isStreaming: false,
@@ -398,4 +686,25 @@ export function useToolCalls() {
         .flat();
     }),
   );
+}
+
+export function useSessionsList() {
+  return useStore(useShallow((state) => state.sessions));
+}
+
+export function useActiveSessionMeta() {
+  return useStore(
+    useShallow((state) => ({
+      sessionId: state.activeSessionId,
+      threadId: state.activeThreadId,
+    })),
+  );
+}
+
+export function useSessionLoading() {
+  return useStore((state) => state.sessionLoading);
+}
+
+export function useResponding() {
+  return useStore((state) => state.responding);
 }
